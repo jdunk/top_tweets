@@ -1,126 +1,216 @@
 var consumer_key    = 'asdf',
     consumer_secret = 'asdf',
-    user_token      = 'asdf',
-    user_secret     = 'asdf';
+    access_token      = 'asdf',
+    access_secret     = 'asdf';
 
-var req_info = {
-  'method': 'GET',
-  'port': 443,
-  'hostname': 'stream.twitter.com',
-  'uri': '/1.1/statuses/sample.json',
-  'query_params': {
-    'delimited': 'length',
-    'language': 'en',
-    'filter_level': 'medium'
-  }
-};
+var util = require('util'),
+    fs = require('fs'),
+    twitterAPI = require('node-twitter-api');
+var twitter = new twitterAPI({
+    consumerKey: consumer_key,
+    consumerSecret: consumer_secret
+});
 
-var crypto = require('crypto'),
-    OAuth = require('oauth'),
-    https = require('https');
-
-var oauth = new OAuth.OAuth('','',consumer_key,consumer_secret,'1.0',null,'HMAC-SHA1');
-
-var oauth_params = [
-    ['oauth_consumer_key', consumer_key],
-    ['oauth_nonce', oauth._getNonce(32)],
-    ['oauth_signature_method', 'HMAC-SHA1'],
-    ['oauth_timestamp', oauth._getTimestamp()],
-    ['oauth_token', user_token],
-    ['oauth_version', '1.0']
-];
-
-var generateOAuthHeader = function(req_info, params) {
-    params.push(['oauth_signature', generateOAuthSig(req_info, params)]);
-    //console.log(require('util').inspect(params));
-    return 'OAuth ' + joinOAuthParams(params);
-};
-
-var joinOAuthParams = function(params) {
-
-    params.sort(function(a, b) {
-        return a[0].localeCompare(b[0]);
-    });
-
-    return params.map(function(curr,idx,arr) {
-        //console.log(curr[0] + '="' + curr[1] + '"');
-        return curr[0] + '="' + curr[1] + '"';
-    }).join(', ');
-};
-
-var generateOAuthSig = function(req_info, oauth_params) {
-
-    var qp = req_info['query_params'];
-
-    // combine query params with oauth params
-    for (var key in qp)
-    {
-        if (qp.hasOwnProperty(key))
-            oauth_params.push([key, qp[key]]);
+/* uncomment to test if credentials are valid
+twitter.verifyCredentials(access_token, access_secret, function(error, data, response) {
+    if (error) {
+        console.log('there was an authentication error. please check that access token and secret are correct.');
+        process.exit();
+    } else {
+        //console.log(util.inspect(data));
+        //console.log(data['screen_name']);
+        console.log('auth successful');
     }
+});
+*/
 
-    oauth_params.sort(function(a, b) {
-        return a[0].localeCompare(b[0]);
-    });
+var top_tweets = [],
+    max_top_tweets_stored = 50,
+    max_top_tweets_displayed = 10,
+    max_age_minutes = 5, // default. overridden by 1st cli arg
+    curr_top_ten_str = '',
+    purge_old_counter = 0;
 
-    var signing_key = encodeURIComponent(consumer_secret) + '&' + encodeURIComponent(user_secret);
+if (process.argv[2])
+    max_age_minutes = process.argv[2];
 
-    var signature_base = req_info['method'].toUpperCase() + '&' +
-        encodeURIComponent(
-            'http' + (req_info['port'] == '443' ? 's' : '') + '://' +
-            req_info['hostname'] + req_info['uri']
-        ) + '&' + 
-        encodeURIComponent(oauth_params.map(function(curr,idx,arr) {
-            //console.log(encodeURIComponent(curr[0]) + '=' + encodeURIComponent(curr[1]));
-            return encodeURIComponent(curr[0]) + '=' + encodeURIComponent(curr[1]);
-        }).join('&'));
-
-    //console.log('signing key: ' + signing_key);
-    //console.log('signature base: ' + signature_base);
-    return crypto.createHmac('sha1', signing_key).update(signature_base).digest('base64');
-};
-
-var getQueryString = function(qp)
+function getTopTweets()
 {
-    if (! qp.length)
-        return '';
+    twitter.getStream('sample', {
+            'language': 'en',
+            'filter_level': 'medium' // possible values: 'none','low','medium'
+        },
+        access_token,
+        access_secret,
+        function(error, data, data_raw, response)
+        {
+            if (error)
+            {
+                console.log('there was an error fetching statuses.');
+                console.log(util.inspect({'error': error, 'data_raw': data_raw}));
+                // no need to exit, just restart
+                // unless, of course, quota is exceeded. check for that case would go here.
+                //process.exit();
+                getTopTweets();
+            }
+            else
+            {
+                if (data['retweeted_status'])
+                {
+                    var tweet = data['retweeted_status'];
 
-    var qpkeys = [];
+                    var tdata = {
+                        'id': tweet['id'],
+                        'count': tweet['retweet_count'],
+                        'name': tweet['user']['name'],
+                        'handle': tweet['user']['screen_name'],
+                        'text': tweet['text'],
+                        'timestamp': tweet['created_at']
+                    };
 
-    for (var key in qp)
+                    var insert_at_pos = null,
+                        delete_at_pos = null;
+
+                    // find insertion position in "count" order
+                    // find removal position for any prior tweet record (i.e. old retweet count)
+                    for (var i=0; i<top_tweets.length; i++)
+                    {
+                        if (insert_at_pos != null && delete_at_pos != null)
+                            break;
+
+                        if (top_tweets[i]['id'] == tdata['id'])
+                        {
+                            // we found old version
+                            if (top_tweets[i]['count'] == tdata['count'])
+                            {
+                                // old verison is up to date. do nothing, exit loop.
+                                insert_at_pos = false;
+                                break;
+                            }
+                            else
+                            {
+                                delete_at_pos = i;
+                            }
+                        }
+                        else if (insert_at_pos == null)
+                        {
+                            if (top_tweets[i]['count'] > tdata['count'])
+                            {
+                                // no need to insert if not in top max_top_tweets_stored
+                                if (i == 0 && top_tweets.length == max_top_tweets_stored)
+                                    break;
+
+                                // tweet has enough retweets, but is it new enough?
+                                // parse date is expensive, so only do it for retweeted enough tweets
+
+                                tdata['timestamp_int'] = Date.parse(tdata['timestamp']);
+
+                                if (tweetIsTooOld(tdata['timestamp_int'], max_age_minutes))
+                                    break;
+                                    
+                                insert_at_pos = i;
+                            }
+                        }
+                    }
+
+                    // if this is now the top-most tweet
+                    if (insert_at_pos == null && 
+                        (! top_tweets.length || (i && tdata['count'] >= top_tweets[top_tweets.length-1]['count'])))
+                    {
+                        tdata['timestamp_int'] = Date.parse(tdata['timestamp']);
+
+                        if (! tweetIsTooOld(tdata['timestamp_int'], max_age_minutes)) 
+                            insert_at_pos = top_tweets.length;
+                    }
+
+                    // remove old tweet
+                    if (delete_at_pos != null)
+                    {
+                        top_tweets.splice(delete_at_pos, 1);
+
+                        if (insert_at_pos != null && delete_at_pos < insert_at_pos)
+                            insert_at_pos--;
+                    }
+
+                    // insert tweet
+                    if (insert_at_pos != null)
+                        top_tweets.splice(insert_at_pos, 0, tdata);
+
+                    // truncate to top max_top_tweets_stored
+                    if (top_tweets.length > max_top_tweets_stored)
+                        top_tweets.splice(0, top_tweets.length - max_top_tweets_stored);
+
+                    displayTopTweets(max_top_tweets_displayed);
+                }
+
+                purge_old_counter++;
+
+                if (purge_old_counter == 50)
+                {
+                    top_tweets = purgeOldTweets(top_tweets, max_age_minutes);
+                    purge_old_counter = 0;
+                }
+            }
+        },
+        function(res) {
+            //console.log('disconnect');
+        }
+    );
+}
+
+function displayTopTweets(max)
+{
+    var str = '';
+
+    for (var i=0; i < max; i++)
     {
-        if (qp.hasOwnProperty(key))
-            qpkeys.push(key);
+        var idx = top_tweets.length-1-i;
+        
+        if (idx < 0)
+            break;
+
+        var t = top_tweets[idx];
+
+        if (i == 0)
+            str += '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n';
+
+        str += '#' + (i+1) + ' [' + t['count'] + '] ' + t['name'] +
+            ' (@' + t['handle'] + ') ' + t['timestamp'] + '\n' +
+            t['text'];
+            
+        if (idx && i < max-1)
+            str += '\n\n-----------------------------------\n';
     }
 
-    return '?' + qpkeys.map(function(key) {
-        return encodeURIComponent(key) + '=' + encodeURIComponent(qp[key]);
-    }).join('&');
-};
+    // only output if there is any change
+    if (str != curr_top_ten_str)
+    {
+        curr_top_ten_str = str;
+        console.log(curr_top_ten_str);
+    }
+}
 
-var req_options = {
-  hostname: req_info['hostname'],
-  port: req_info['port'],
-  path: req_info['uri'] + getQueryString(req_info['query_params']),
-  method: 'GET',
-  headers: { 'Authorization': generateOAuthHeader(req_info, oauth_params) }
-  //rejectUnauthorized: false
-};
+function tweetIsTooOld(timestamp_int, max_age_minutes)
+{
+    return ((new Date).getTime() - timestamp_int) / 60000 > max_age_minutes;
+}
 
-var req = https.request(req_options, function(res) {
-  console.log('STATUS: ' + res.statusCode);
-  console.log('HEADERS: ' + JSON.stringify(res.headers));
-  res.setEncoding('utf8');
-  res.on('data', function (chunk) {
-    console.log('BODY: ' + chunk);
-  });
-});
+function purgeOldTweets(tweets, max_age_minutes)
+{
+    var keep = [];
 
-req.on('error', function(e) {
-  console.log('problem with request: ' + e.message);
-});
+    for (var i=0; i<tweets.length; i++)
+    {
+        if (! tweetIsTooOld(tweets[i]['timestamp_int'], max_age_minutes))
+            keep.push(tweets[i]);
+    }
 
-// write data to request body
-req.write('data\n');
-req.write('data\n');
-req.end();
+    return keep;
+}
+
+function dbg(str)
+{
+    fs.appendFile('debug.log', str + '\n', function (err) {});
+}
+
+getTopTweets();
