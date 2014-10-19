@@ -2,4 +2,4 @@ Dependencies
 ==========
 
 * node
-* npm install -g http util oauth
+* npm install util node-twitter-api
